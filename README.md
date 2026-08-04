@@ -125,7 +125,30 @@ restart it if it ever dies.
 
 **Title never changes.** Check `herdr plugin action invoke ghostty-tab-title.status`, then the watcher log (its path is in that output). A `no_foreground_client` reason at debug level means herdr has no client attached to push to.
 
-**Title changes, Ghostty ignores it.** A `title = ...` line in `~/.config/ghostty/config` pins the tab title and discards OSC titles. Remove it.
+**Title changes, Ghostty ignores it — most common cause.** If you ever renamed
+the tab yourself (`prompt_tab_title`, or right-click the tab and rename), Ghostty
+pins that title: *"The title set via this prompt overrides any title set by the
+terminal."* Every OSC title, including this plugin's, is then discarded. Clear the
+override with an empty `set_tab_title`:
+
+```
+# ~/.config/ghostty/config
+keybind = cmd+shift+u=set_tab_title:
+```
+
+Reload the config, press it once in each affected tab, and the tab goes back to
+following the terminal. To keep a human-readable name, move it into this plugin's
+`label` instead of Ghostty's tab title — you then get the name *and* the counts:
+
+```toml
+label = "Build Box"
+```
+
+A `title = ...` line in `~/.config/ghostty/config` pins titles the same way.
+Remove it.
+
+Quick check on whether a given tab is pinned: `printf '\033]0;PINNED?\007'`. If
+the tab title does not change, it is pinned.
 
 **`config.toml ignored: python 3.x has no tomllib`.** Python is older than 3.11. Use `config.json` with the same keys.
 
