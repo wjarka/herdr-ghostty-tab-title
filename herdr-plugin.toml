@@ -1,0 +1,47 @@
+id = "ghostty-tab-title"
+name = "Ghostty tab title"
+version = "0.1.0"
+min_herdr_version = "0.7.4"
+description = "Shows color-coded agent status counts (blocked / done / working / idle) in the Ghostty tab title."
+platforms = ["linux", "macos"]
+
+# Long-lived watcher. Starts detached and returns immediately, so it never
+# blocks herdr's startup sequence.
+[[startup]]
+command = ["python3", "bin/herdr-ghostty-title", "start"]
+
+# Self-heal: if the watcher died, these cheap no-op-when-alive hooks bring it
+# back the next time you create a tab or a workspace. Both exit in milliseconds
+# when the watcher is already running.
+[[events]]
+on = "tab.created"
+command = ["python3", "bin/herdr-ghostty-title", "ensure"]
+
+[[events]]
+on = "workspace.created"
+command = ["python3", "bin/herdr-ghostty-title", "ensure"]
+
+[[actions]]
+id = "start"
+title = "Ghostty title: start watcher"
+command = ["python3", "bin/herdr-ghostty-title", "start"]
+
+[[actions]]
+id = "stop"
+title = "Ghostty title: stop watcher"
+command = ["python3", "bin/herdr-ghostty-title", "stop"]
+
+[[actions]]
+id = "restart"
+title = "Ghostty title: restart watcher"
+command = ["python3", "bin/herdr-ghostty-title", "restart"]
+
+[[actions]]
+id = "status"
+title = "Ghostty title: watcher status"
+command = ["python3", "bin/herdr-ghostty-title", "status"]
+
+[[actions]]
+id = "refresh"
+title = "Ghostty title: refresh once"
+command = ["python3", "bin/herdr-ghostty-title", "once"]

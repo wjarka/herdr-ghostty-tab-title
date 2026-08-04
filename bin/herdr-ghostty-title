@@ -1,0 +1,719 @@
+#!/usr/bin/env python3
+"""Mirror herdr agent status counts into the Ghostty tab title.
+
+Talks to the herdr server over its unix socket:
+  * subscribes to unfiltered pane/tab/workspace events as a change signal
+  * re-reads `agent.list` (authoritative) whenever something moved
+  * pushes a rendered title via `client.window_title.set`, which makes the
+    attached herdr client emit OSC 0 -> Ghostty picks it up as the tab title
+
+Stdlib only. Works against a local server or, when installed on a remote host,
+against that host's server: the title travels back over the remote-client
+bridge to the Ghostty tab the `herdr --remote` client lives in.
+"""
+
+from __future__ import annotations
+
+import errno
+import fcntl
+import json
+import os
+import re
+import select
+import signal
+import socket
+import subprocess
+import sys
+import time
+
+STATUSES = ("blocked", "done", "working", "idle", "unknown")
+
+# Argument order for the `render` preview command.
+STATUSES_RENDER_ORDER = ("blocked", "done", "working", "idle", "unknown")
+
+DEFAULTS = {
+    # None -> short hostname of the machine the herdr server runs on.
+    "label": None,
+    # Which statuses to show, in this order. Drop or reorder freely.
+    "show": ["blocked", "done", "working", "idle"],
+    "glyphs": {
+        "blocked": "\N{LARGE RED CIRCLE}",
+        "done": "\N{LARGE GREEN CIRCLE}",
+        "working": "\N{LARGE YELLOW CIRCLE}",
+        "idle": "\N{MEDIUM WHITE CIRCLE}",
+        "unknown": "\N{MEDIUM BLACK CIRCLE}",
+    },
+    # Skip statuses whose count is zero.
+    "hide_zero": True,
+    # Between a glyph and its number.
+    "count_separator": " ",
+    # Between two status groups.
+    "item_separator": "  ",
+    # Between the label and the first status group.
+    "label_separator": "  ",
+    # Shown after the label when the server has no agents at all.
+    "empty_text": "",
+    # Coalesce bursts of events into one refresh.
+    "debounce_ms": 250,
+    # Unconditional re-assert, so a freshly (re)attached client gets the title.
+    "reconcile_seconds": 10,
+    # Ghostty truncates long titles anyway; keep the payload sane.
+    "max_title_chars": 120,
+    # Give up (and let the [[startup]] hook restart us later) after this long
+    # with no reachable server, so `herdr server stop` does not leave a stray
+    # process retrying forever. 0 means retry indefinitely.
+    "abandon_after_seconds": 600,
+    # Restore herdr's own title when the watcher shuts down cleanly.
+    "clear_on_exit": True,
+    "log_level": "info",
+    "log_max_bytes": 262144,
+}
+
+LEVELS = {"debug": 10, "info": 20, "warn": 30, "error": 40}
+
+
+# --------------------------------------------------------------------------- #
+# environment / paths
+# --------------------------------------------------------------------------- #
+
+
+def plugin_root() -> str:
+    root = os.environ.get("HERDR_PLUGIN_ROOT")
+    if root and os.path.isdir(root):
+        return root
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def state_dir() -> str:
+    path = os.environ.get("HERDR_PLUGIN_STATE_DIR") or os.path.join(
+        os.path.expanduser("~"), ".local", "state", "herdr-ghostty-tab-title"
+    )
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def config_dir() -> str:
+    return os.environ.get("HERDR_PLUGIN_CONFIG_DIR") or os.path.join(
+        os.path.expanduser("~"), ".config", "herdr-ghostty-tab-title"
+    )
+
+
+def socket_path() -> str:
+    path = os.environ.get("HERDR_SOCKET_PATH")
+    if path:
+        return path
+    return os.path.join(os.path.expanduser("~"), ".config", "herdr", "herdr.sock")
+
+
+def lock_file() -> str:
+    return os.path.join(state_dir(), "watcher.lock")
+
+
+def log_file() -> str:
+    return os.path.join(state_dir(), "watcher.log")
+
+
+# --------------------------------------------------------------------------- #
+# config
+# --------------------------------------------------------------------------- #
+
+
+def _deep_merge(base: dict, override: dict) -> dict:
+    out = dict(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(out.get(key), dict):
+            out[key] = _deep_merge(out[key], value)
+        else:
+            out[key] = value
+    return out
+
+
+def load_config(log=None) -> dict:
+    cfg = json.loads(json.dumps(DEFAULTS))  # deep copy of plain data
+
+    explicit = os.environ.get("HERDR_GHOSTTY_TITLE_CONFIG")
+    candidates = (
+        [explicit]
+        if explicit
+        else [
+            os.path.join(config_dir(), "config.toml"),
+            os.path.join(config_dir(), "config.json"),
+        ]
+    )
+
+    for path in candidates:
+        if not path or not os.path.isfile(path):
+            continue
+        try:
+            if path.endswith(".json"):
+                with open(path, "rb") as fh:
+                    user = json.load(fh)
+            else:
+                try:
+                    import tomllib
+                except ModuleNotFoundError:
+                    if log:
+                        log(
+                            "warn",
+                            f"{path} ignored: python {sys.version_info.major}."
+                            f"{sys.version_info.minor} has no tomllib; use config.json instead",
+                        )
+                    continue
+                with open(path, "rb") as fh:
+                    user = tomllib.load(fh)
+            cfg = _deep_merge(cfg, user)
+            cfg["_source"] = path
+        except Exception as exc:  # noqa: BLE001 - never die on bad config
+            if log:
+                log("error", f"failed to read {path}: {exc}")
+        break
+
+    env_label = os.environ.get("HERDR_GHOSTTY_TITLE_LABEL")
+    if env_label is not None:
+        cfg["label"] = env_label
+    if os.environ.get("HERDR_GHOSTTY_TITLE_DEBUG"):
+        cfg["log_level"] = "debug"
+
+    if cfg.get("label") is None:
+        cfg["label"] = socket.gethostname().split(".")[0]
+
+    show = [s for s in cfg.get("show", []) if s in STATUSES]
+    cfg["show"] = show or list(DEFAULTS["show"])
+    return cfg
+
+
+# --------------------------------------------------------------------------- #
+# rendering (pure)
+# --------------------------------------------------------------------------- #
+
+_TITLE_UNSAFE = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def count_statuses(agents) -> dict:
+    counts = {s: 0 for s in STATUSES}
+    for agent in agents or []:
+        status = agent.get("agent_status") or "unknown"
+        if status not in counts:
+            status = "unknown"
+        counts[status] += 1
+    return counts
+
+
+def render_title(counts: dict, cfg: dict) -> str:
+    glyphs = cfg.get("glyphs", {})
+    parts = []
+    for status in cfg["show"]:
+        count = counts.get(status, 0)
+        if count == 0 and cfg.get("hide_zero", True):
+            continue
+        glyph = glyphs.get(status, status)
+        parts.append(f"{glyph}{cfg.get('count_separator', ' ')}{count}")
+
+    label = str(cfg.get("label") or "").strip()
+    if parts:
+        body = cfg.get("item_separator", "  ").join(parts)
+        title = f"{label}{cfg.get('label_separator', '  ')}{body}" if label else body
+    else:
+        empty = str(cfg.get("empty_text") or "")
+        title = f"{label}{cfg.get('label_separator', '  ')}{empty}" if label and empty else (label or empty)
+
+    title = _TITLE_UNSAFE.sub("", title).strip()
+    limit = int(cfg.get("max_title_chars", 120) or 0)
+    if limit and len(title) > limit:
+        title = title[: max(1, limit - 1)] + "\N{HORIZONTAL ELLIPSIS}"
+    return title
+
+
+# --------------------------------------------------------------------------- #
+# herdr socket client
+# --------------------------------------------------------------------------- #
+
+
+class HerdrError(RuntimeError):
+    pass
+
+
+def request(method: str, params=None, sock_path=None, timeout=5.0):
+    """One-shot request on its own connection. Returns the `result` payload."""
+    path = sock_path or socket_path()
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.settimeout(timeout)
+    try:
+        sock.connect(path)
+        payload = {"id": f"gt_{os.getpid()}_{int(time.time() * 1000) % 100000}",
+                   "method": method,
+                   "params": params or {}}
+        sock.sendall((json.dumps(payload) + "\n").encode("utf-8"))
+        line = sock.makefile("r", encoding="utf-8").readline()
+    finally:
+        try:
+            sock.close()
+        except OSError:
+            pass
+    if not line:
+        raise HerdrError(f"{method}: empty response")
+    reply = json.loads(line)
+    if "error" in reply:
+        err = reply["error"]
+        raise HerdrError(f"{method}: {err.get('code')}: {err.get('message')}")
+    return reply.get("result", {})
+
+
+SUBSCRIPTIONS = [
+    # `pane.agent_status_changed` requires a pane_id, so it cannot be used as a
+    # global feed. These unfiltered kinds cover every way a count can change.
+    "pane.created",
+    "pane.updated",
+    "pane.closed",
+    "pane.exited",
+    "pane.agent_detected",
+    "tab.created",
+    "tab.closed",
+    "workspace.created",
+    "workspace.closed",
+]
+
+
+def open_subscription(sock_path: str, timeout=5.0) -> socket.socket:
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.settimeout(timeout)
+    sock.connect(sock_path)
+    req = {
+        "id": "gt_sub",
+        "method": "events.subscribe",
+        "params": {"subscriptions": [{"type": kind} for kind in SUBSCRIPTIONS]},
+    }
+    sock.sendall((json.dumps(req) + "\n").encode("utf-8"))
+    ack = sock.makefile("r", encoding="utf-8").readline()
+    if not ack:
+        raise HerdrError("events.subscribe: no acknowledgement")
+    reply = json.loads(ack)
+    if "error" in reply:
+        raise HerdrError(f"events.subscribe: {reply['error']}")
+    sock.setblocking(False)
+    return sock
+
+
+# --------------------------------------------------------------------------- #
+# logging
+# --------------------------------------------------------------------------- #
+
+
+def make_logger(cfg):
+    threshold = LEVELS.get(str(cfg.get("log_level", "info")).lower(), 20)
+    max_bytes = int(cfg.get("log_max_bytes", 262144))
+    path = log_file()
+
+    def log(level, message):
+        if LEVELS.get(level, 20) < threshold:
+            return
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%S")
+        line = f"{stamp} [{level}] {message}\n"
+        try:
+            if max_bytes and os.path.exists(path) and os.path.getsize(path) > max_bytes:
+                os.replace(path, path + ".1")
+            with open(path, "a", encoding="utf-8") as fh:
+                fh.write(line)
+        except OSError:
+            pass
+        if os.environ.get("HERDR_GHOSTTY_TITLE_FOREGROUND"):
+            sys.stderr.write(line)
+
+    return log
+
+
+# --------------------------------------------------------------------------- #
+# single-instance lock
+# --------------------------------------------------------------------------- #
+
+
+def acquire_lock():
+    """Return an open, flocked fd, or None if another watcher holds it."""
+    fd = os.open(lock_file(), os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as exc:
+        os.close(fd)
+        if exc.errno in (errno.EACCES, errno.EAGAIN):
+            return None
+        raise
+    os.ftruncate(fd, 0)
+    os.write(fd, f"{os.getpid()}\n".encode())
+    os.fsync(fd)
+    return fd
+
+
+def running_pid():
+    """PID of the live watcher, or None."""
+    path = lock_file()
+    if not os.path.exists(path):
+        return None
+    fd = os.open(path, os.O_RDWR)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        try:
+            with open(path, encoding="utf-8") as fh:
+                return int((fh.read().strip() or "0")) or None
+        except (OSError, ValueError):
+            return -1  # locked but unreadable pid
+        finally:
+            os.close(fd)
+    else:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+        return None
+
+
+# --------------------------------------------------------------------------- #
+# watcher
+# --------------------------------------------------------------------------- #
+
+
+class Watcher:
+    def __init__(self, cfg, log):
+        self.cfg = cfg
+        self.log = log
+        self.sock_path = socket_path()
+        self.last_title = None
+        self.stopping = False
+        self.wake_fd = None
+
+    def stop(self, *_args):
+        self.stopping = True
+
+    def counts(self):
+        result = request("agent.list", sock_path=self.sock_path)
+        return count_statuses(result.get("agents"))
+
+    def push(self, force=False):
+        counts = self.counts()
+        title = render_title(counts, self.cfg)
+        if title == self.last_title and not force:
+            return
+        result = request(
+            "client.window_title.set", {"title": title}, sock_path=self.sock_path
+        )
+        reason = result.get("reason")
+        if reason == "no_foreground_client":
+            # Nothing attached right now; forget the title so the next attach
+            # gets a fresh push.
+            self.last_title = None
+            self.log("debug", f"no foreground client, skipped: {title!r}")
+            return
+        self.last_title = title
+        self.log("debug", f"title -> {title!r} ({reason})")
+
+    def clear(self):
+        try:
+            request("client.window_title.clear", sock_path=self.sock_path)
+        except (HerdrError, OSError) as exc:
+            self.log("debug", f"clear failed: {exc}")
+
+    def run(self):
+        signal.signal(signal.SIGTERM, self.stop)
+        signal.signal(signal.SIGINT, self.stop)
+        # Self-pipe so a signal interrupts select() immediately instead of
+        # waiting out the current timeout (PEP 475 restarts the syscall).
+        wake_r, wake_w = os.pipe()
+        os.set_blocking(wake_r, False)
+        os.set_blocking(wake_w, False)
+        signal.set_wakeup_fd(wake_w)
+        self.wake_fd = wake_r
+
+        debounce = max(0.0, int(self.cfg.get("debounce_ms", 250)) / 1000.0)
+        reconcile = max(1.0, float(self.cfg.get("reconcile_seconds", 10)))
+        abandon = max(0.0, float(self.cfg.get("abandon_after_seconds", 600)))
+        backoff = 0.5
+        down_since = None
+
+        self.log("info", f"watcher {os.getpid()} started, socket={self.sock_path}")
+
+        while not self.stopping:
+            sub = None
+            try:
+                sub = open_subscription(self.sock_path)
+                backoff = 0.5
+                down_since = None
+                self.log("info", "subscribed to herdr events")
+                self.push(force=True)
+                self._pump(sub, debounce, reconcile)
+            except (HerdrError, OSError, ValueError) as exc:
+                if self.stopping:
+                    break
+                now = time.monotonic()
+                if down_since is None:
+                    down_since = now
+                elif abandon and now - down_since > abandon:
+                    self.log(
+                        "info",
+                        f"no server for {abandon:.0f}s; exiting (startup hook will "
+                        "bring me back)",
+                    )
+                    break
+                self.log("warn", f"connection lost ({exc}); retrying in {backoff:.1f}s")
+                self.last_title = None
+                slept = 0.0
+                while slept < backoff and not self.stopping:
+                    time.sleep(min(0.25, backoff - slept))
+                    slept += 0.25
+                backoff = min(10.0, backoff * 2)
+            finally:
+                if sub is not None:
+                    try:
+                        sub.close()
+                    except OSError:
+                        pass
+
+        signal.set_wakeup_fd(-1)
+        for fd in (wake_r, wake_w):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+        if self.cfg.get("clear_on_exit", True):
+            self.clear()
+        self.log("info", "watcher stopped")
+
+    def _pump(self, sub, debounce, reconcile):
+        buf = b""
+        dirty_at = None
+        next_reconcile = time.monotonic() + reconcile
+
+        while not self.stopping:
+            now = time.monotonic()
+            waits = [next_reconcile - now]
+            if dirty_at is not None:
+                waits.append(dirty_at - now)
+            timeout = max(0.02, min(waits))
+
+            watch = [sub] + ([self.wake_fd] if self.wake_fd is not None else [])
+            try:
+                readable, _, _ = select.select(watch, [], [], timeout)
+            except InterruptedError:
+                continue
+            except OSError:
+                if self.stopping:
+                    return
+                raise
+
+            if self.wake_fd in readable:
+                try:
+                    os.read(self.wake_fd, 4096)
+                except (BlockingIOError, OSError):
+                    pass
+                if self.stopping:
+                    return
+
+            if sub in readable:
+                try:
+                    chunk = sub.recv(65536)
+                except BlockingIOError:
+                    chunk = b""
+                except OSError as exc:
+                    raise HerdrError(f"event stream read failed: {exc}") from exc
+                if chunk == b"":
+                    raise HerdrError("event stream closed by server")
+                buf += chunk
+                if len(buf) > 4 << 20:  # pathological backlog; drop it
+                    buf = b""
+                if b"\n" in buf:
+                    buf = buf[buf.rfind(b"\n") + 1:]
+                    if dirty_at is None:
+                        dirty_at = time.monotonic() + debounce
+
+            now = time.monotonic()
+            if now >= next_reconcile:
+                # Unconditional re-assert on its own clock: covers client
+                # detach/reattach and any event we did not subscribe to. This
+                # timer is deliberately independent of the debounced pushes,
+                # which on a busy server would otherwise keep deferring it.
+                dirty_at = None
+                self.push(force=True)
+                next_reconcile = time.monotonic() + reconcile
+            elif dirty_at is not None and now >= dirty_at:
+                dirty_at = None
+                self.push()
+
+
+# --------------------------------------------------------------------------- #
+# process control
+# --------------------------------------------------------------------------- #
+
+
+def spawn_detached() -> int:
+    """Start `run` in a fully detached child and return its pid."""
+    script = os.path.abspath(__file__)
+    env = dict(os.environ)
+    env.pop("HERDR_GHOSTTY_TITLE_FOREGROUND", None)
+    devnull = os.open(os.devnull, os.O_RDWR)
+    try:
+        proc = subprocess.Popen(
+            [sys.executable, script, "run"],
+            cwd=plugin_root(),
+            env=env,
+            stdin=devnull,
+            stdout=devnull,
+            stderr=devnull,
+            start_new_session=True,
+            close_fds=True,
+        )
+    finally:
+        os.close(devnull)
+    return proc.pid
+
+
+def cmd_run(_argv) -> int:
+    cfg = load_config()
+    log = make_logger(cfg)
+    fd = acquire_lock()
+    if fd is None:
+        log("info", "another watcher already holds the lock; exiting")
+        return 0
+    try:
+        Watcher(cfg, log).run()
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+        except OSError:
+            pass
+    return 0
+
+
+def cmd_start(_argv) -> int:
+    pid = running_pid()
+    if pid:
+        print(f"already running (pid {pid})")
+        return 0
+    child = spawn_detached()
+    # Give it a moment so `start` can report a real outcome.
+    for _ in range(20):
+        time.sleep(0.05)
+        pid = running_pid()
+        if pid:
+            print(f"started (pid {pid})")
+            return 0
+    print(f"spawned pid {child} but it did not take the lock; see {log_file()}")
+    return 1
+
+
+def cmd_ensure(_argv) -> int:
+    if running_pid():
+        return 0
+    return cmd_start(_argv)
+
+
+def cmd_stop(_argv) -> int:
+    pid = running_pid()
+    if not pid:
+        print("not running")
+        return 0
+    if pid < 0:
+        print("running but pid unknown; kill it manually")
+        return 1
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        print("not running")
+        return 0
+    except PermissionError:
+        print(f"cannot signal pid {pid}")
+        return 1
+    for _ in range(40):
+        time.sleep(0.05)
+        if not running_pid():
+            print(f"stopped (pid {pid})")
+            return 0
+    print(f"pid {pid} still running")
+    return 1
+
+
+def cmd_restart(argv) -> int:
+    cmd_stop(argv)
+    return cmd_start(argv)
+
+
+def cmd_status(_argv) -> int:
+    cfg = load_config()
+    pid = running_pid()
+    print(f"watcher:  {'running (pid %s)' % pid if pid else 'stopped'}")
+    print(f"socket:   {socket_path()}")
+    print(f"config:   {cfg.get('_source', '(defaults)')}")
+    print(f"log:      {log_file()}")
+    print(f"label:    {cfg['label']}")
+    try:
+        counts = count_statuses(request("agent.list").get("agents"))
+        print(f"counts:   {json.dumps({k: v for k, v in counts.items()})}")
+        print(f"title:    {render_title(counts, cfg)}")
+    except (HerdrError, OSError) as exc:
+        print(f"server:   unreachable ({exc})")
+        return 1
+    return 0
+
+
+def cmd_once(_argv) -> int:
+    cfg = load_config()
+    counts = count_statuses(request("agent.list").get("agents"))
+    title = render_title(counts, cfg)
+    result = request("client.window_title.set", {"title": title})
+    print(f"{title}   [{result.get('reason')}]")
+    return 0
+
+
+def cmd_clear(_argv) -> int:
+    result = request("client.window_title.clear")
+    print(result.get("reason", "cleared"))
+    return 0
+
+
+def cmd_render(argv) -> int:
+    """Preview a title without touching the server.
+
+    Usage: render [blocked] [done] [working] [idle] [unknown]
+    """
+    cfg = load_config()
+    nums = [int(a) for a in argv[:5]] + [0] * 5
+    counts = dict(zip(STATUSES_RENDER_ORDER, nums))
+    print(render_title(counts, cfg))
+    return 0
+
+
+COMMANDS = {
+    "run": cmd_run,
+    "start": cmd_start,
+    "ensure": cmd_ensure,
+    "stop": cmd_stop,
+    "restart": cmd_restart,
+    "status": cmd_status,
+    "once": cmd_once,
+    "clear": cmd_clear,
+    "render": cmd_render,
+}
+
+
+def main(argv) -> int:
+    command = argv[0] if argv else "status"
+    handler = COMMANDS.get(command)
+    if handler is None:
+        sys.stderr.write(
+            f"unknown command {command!r}\nusage: herdr-ghostty-title "
+            f"<{'|'.join(COMMANDS)}>\n"
+        )
+        return 2
+    try:
+        return handler(argv[1:])
+    except HerdrError as exc:
+        sys.stderr.write(f"{exc}\n")
+        return 1
+    except FileNotFoundError:
+        sys.stderr.write(f"herdr socket not found at {socket_path()}\n")
+        return 1
+    except ConnectionRefusedError:
+        sys.stderr.write(f"herdr server not accepting connections at {socket_path()}\n")
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

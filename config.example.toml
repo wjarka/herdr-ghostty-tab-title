@@ -1,0 +1,59 @@
+# herdr-ghostty-tab-title configuration
+#
+# Copy to the plugin's config dir and edit:
+#   cp config.example.toml "$(herdr plugin config-dir ghostty-tab-title)/config.toml"
+#   herdr plugin action invoke ghostty-tab-title.restart
+#
+# Every value below is a default. Delete anything you do not want to change.
+# A config.json with the same keys works too (use that on Python < 3.11, which
+# has no tomllib).
+
+# Prefix shown before the counts. Defaults to the short hostname of the machine
+# the herdr server runs on, which is what you want for `herdr --remote` tabs.
+# label = "web-01"
+
+# Which statuses appear, in this order. Drop any of them, add "unknown".
+# The default is herdr's attention order: what needs you comes first.
+# show = ["blocked", "done", "working", "idle"]
+
+# Ghostty tab titles are plain text, so "color" means colored glyphs.
+# [glyphs]
+# blocked = "🔴"   # waiting on you
+# done    = "🟢"   # finished, needs review
+# working = "🟡"   # busy
+# idle    = "⚪"   # nothing happening
+# unknown = "⚫"   # herdr cannot tell
+
+# Omit statuses whose count is zero. Set false for fixed positions you can read
+# by position rather than by glyph.
+# hide_zero = true
+
+# Spacing. count_separator sits between a glyph and its number.
+# count_separator = " "
+# item_separator  = "  "
+# label_separator = "  "
+
+# Shown after the label when the server has no agents at all.
+# empty_text = ""
+
+# Coalesce bursts of herdr events into a single title update.
+# debounce_ms = 250
+
+# Unconditional re-push interval. Also how quickly a freshly re-attached client
+# gets its title back.
+# reconcile_seconds = 10
+
+# Hard cap on title length; 0 disables truncation.
+# max_title_chars = 120
+
+# Restore herdr's own title when the watcher stops.
+# clear_on_exit = true
+
+# "debug" logs every title push to the watcher log.
+# log_level = "info"
+# log_max_bytes = 262144
+
+# Exit after this long with no reachable herdr server (0 = retry forever), so a
+# stopped server does not leave a watcher retrying in the background. The
+# [[startup]] hook brings it back with the server.
+# abandon_after_seconds = 600
