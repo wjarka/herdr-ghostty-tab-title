@@ -132,6 +132,64 @@ class TestRender(unittest.TestCase):
         self.assertTrue(len(title) > 200)
 
 
+class TestLabelTokens(unittest.TestCase):
+    def test_session_name_from_default_socket(self):
+        os.environ["HERDR_SOCKET_PATH"] = "/home/x/.config/herdr/herdr.sock"
+        try:
+            self.assertEqual(hgt.session_name(), "default")
+        finally:
+            del os.environ["HERDR_SOCKET_PATH"]
+
+    def test_session_name_from_named_socket(self):
+        os.environ["HERDR_SOCKET_PATH"] = "/home/x/.config/herdr/sessions/work/herdr.sock"
+        try:
+            self.assertEqual(hgt.session_name(), "work")
+        finally:
+            del os.environ["HERDR_SOCKET_PATH"]
+
+    def test_host_token(self):
+        import socket as _socket
+
+        short = _socket.gethostname().split(".")[0]
+        self.assertEqual(hgt.expand_label("{host}"), short)
+
+    def test_combined_tokens(self):
+        os.environ["HERDR_SOCKET_PATH"] = "/home/x/.config/herdr/sessions/work/herdr.sock"
+        try:
+            self.assertEqual(hgt.expand_label("box/{session}"), "box/work")
+        finally:
+            del os.environ["HERDR_SOCKET_PATH"]
+
+    def test_unknown_braces_left_alone(self):
+        self.assertEqual(hgt.expand_label("a {nope} b"), "a {nope} b")
+
+    def test_default_label_is_host(self):
+        import socket as _socket
+
+        self.assertEqual(
+            hgt.load_config()["label"], _socket.gethostname().split(".")[0]
+        )
+
+    def test_label_from_config_is_expanded(self):
+        import json
+        import tempfile
+
+        os.environ["HERDR_SOCKET_PATH"] = "/home/x/.config/herdr/sessions/work/herdr.sock"
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as fh:
+            json.dump({"label": "{session}@{host}"}, fh)
+            path = fh.name
+        os.environ["HERDR_GHOSTTY_TITLE_CONFIG"] = path
+        try:
+            import socket as _socket
+
+            short = _socket.gethostname().split(".")[0]
+            self.assertEqual(hgt.load_config()["label"], f"work@{short}")
+        finally:
+            del os.environ["HERDR_GHOSTTY_TITLE_CONFIG"]
+            del os.environ["HERDR_SOCKET_PATH"]
+            os.unlink(path)
+
+
 class TestConfig(unittest.TestCase):
     def test_defaults_are_sane(self):
         c = hgt.load_config()

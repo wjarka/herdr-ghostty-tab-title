@@ -76,6 +76,26 @@ herdr plugin action invoke ghostty-tab-title.restart
 
 Two env vars are handy for one-off runs: `HERDR_GHOSTTY_TITLE_LABEL` overrides the label, `HERDR_GHOSTTY_TITLE_DEBUG=1` logs every title push.
 
+### Labels
+
+`label` takes two tokens:
+
+| Token | Expands to |
+|---|---|
+| `{host}` | short hostname of the machine running the herdr server |
+| `{session}` | herdr session name — `default`, or the `--session` name |
+
+The default is `{host}`, so a `herdr --remote` tab names itself after the remote
+box with no configuration. Set `label = "{host}/{session}"` if you run several
+named sessions on one host, or hard-code a human name (`label = "Management
+Dashboard"`) — that is the better place for it than a Ghostty tab title, since
+you keep the counts.
+
+The session name is not in herdr's socket API at all (`session.snapshot` carries
+only version, protocol, focused ids and the object lists), so it is derived from
+the socket path: `<config>/sessions/<name>/herdr.sock` for a named session,
+`<config>/herdr.sock` for `default`.
+
 ## Commands
 
 Through herdr:

@@ -106,6 +106,20 @@ def socket_path() -> str:
     return os.path.join(os.path.expanduser("~"), ".config", "herdr", "herdr.sock")
 
 
+def session_name() -> str:
+    """Name of the herdr session this server serves.
+
+    The socket API exposes no session identity (session.snapshot carries only
+    version/protocol/focused ids and the object lists), but the socket path does:
+    a named session lives at <config>/sessions/<name>/herdr.sock, while the
+    default one sits directly in <config>/herdr.sock.
+    """
+    parts = os.path.realpath(socket_path()).split(os.sep)
+    if len(parts) >= 3 and parts[-3] == "sessions":
+        return parts[-2]
+    return "default"
+
+
 def _socket_tag() -> str:
     """Short stable tag for the server we watch.
 
@@ -137,6 +151,14 @@ def _deep_merge(base: dict, override: dict) -> dict:
         else:
             out[key] = value
     return out
+
+
+def expand_label(label: str) -> str:
+    """Expand {host} and {session} in a label. Unknown braces are left alone."""
+    return (
+        label.replace("{host}", socket.gethostname().split(".")[0])
+        .replace("{session}", session_name())
+    )
 
 
 def load_config(log=None) -> dict:
@@ -186,7 +208,8 @@ def load_config(log=None) -> dict:
         cfg["log_level"] = "debug"
 
     if cfg.get("label") is None:
-        cfg["label"] = socket.gethostname().split(".")[0]
+        cfg["label"] = "{host}"
+    cfg["label"] = expand_label(str(cfg["label"]))
 
     show = [s for s in cfg.get("show", []) if s in STATUSES]
     cfg["show"] = show or list(DEFAULTS["show"])

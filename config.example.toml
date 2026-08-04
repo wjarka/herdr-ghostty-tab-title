@@ -8,9 +8,13 @@
 # A config.json with the same keys works too (use that on Python < 3.11, which
 # has no tomllib).
 
-# Prefix shown before the counts. Defaults to the short hostname of the machine
-# the herdr server runs on, which is what you want for `herdr --remote` tabs.
-# label = "web-01"
+# Prefix shown before the counts. Two tokens are expanded:
+#   {host}     short hostname of the machine the herdr server runs on
+#   {session}  herdr session name ("default", or the --session name)
+# The default is "{host}", which is what you want for `herdr --remote` tabs.
+# Use "{host}/{session}" if you run several named sessions on one host, or just
+# hard-code a human name.
+# label = "Build Box"
 
 # Which statuses appear, in this order. Drop any of them, add "unknown".
 # The default is herdr's attention order: what needs you comes first.
