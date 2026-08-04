@@ -6,8 +6,8 @@ session's socket, synthesises agent states with `pane.report_agent`, and asserts
 on the OSC 0 title sequences herdr writes to the pty. That pty stands in for the
 Ghostty tab, so a pass here means Ghostty gets the same bytes.
 
-Requires: herdr on PATH, and no HERDR_* env (the script strips it for the child;
-nested herdr is refused otherwise).
+Requires: herdr on PATH (or HERDR_BIN pointing at a build), and no HERDR_* env
+(the script strips it for the child; nested herdr is refused otherwise).
 
 Run: python3 tests/integration_test.py
 """
@@ -30,6 +30,9 @@ import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 WATCHER = os.path.join(ROOT, "bin", "herdr-ghostty-title")
+# Point HERDR_BIN at another build to run this suite against a different herdr
+# version (e.g. HERDR_BIN=./herdr080 to check a new release before upgrading).
+HERDR_BIN = os.environ.get("HERDR_BIN", "herdr")
 SESSION = "hgt-itest"
 SESSION_DIR = os.path.expanduser(f"~/.config/herdr/sessions/{SESSION}")
 SOCK = os.path.join(SESSION_DIR, "herdr.sock")
@@ -83,7 +86,7 @@ class Session:
                 if key.startswith("HERDR_"):
                     del os.environ[key]
             os.environ.pop("TMUX", None)
-            os.execvp("herdr", ["herdr", "--session", SESSION])
+            os.execvp(HERDR_BIN, [HERDR_BIN, "--session", SESSION])
             os._exit(127)
         self.pid, self.fd = pid, fd
         fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 50, 200, 0, 0))

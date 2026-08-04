@@ -26,9 +26,31 @@ Ghostty tab titles are plain text — no ANSI colors — so color coding is done
 
 Glyphs, order, and spacing are all configurable — see [config.example.toml](config.example.toml). herdr does not publish its own status palette, so these are chosen to match the semantics, not sampled from its theme.
 
+## herdr compatibility
+
+| herdr | Status |
+|---|---|
+| < 0.7.0 | Will not work. `client.window_title.set/clear` and the plugin system (manifest actions + event hooks, config/state dirs) all landed in 0.7.0. |
+| 0.7.0 – 0.7.2 | Every API used exists, but untested. The `done` count can go stale: 0.7.3 fixed re-focusing a done agent leaving stale `done` status in API responses. |
+| 0.7.3 | Lowest version with accurate `done` counts. Untested. |
+| **0.7.4** | **Verified** — full suite, macOS and Linux. Declared `min_herdr_version`. Autostart comes from the event hooks; `[[startup]]` is parsed but ignored. |
+| 0.7.5 – 0.7.x | `[[startup]]` hooks added in 0.7.5, so autostart uses those. Note 0.7.5's breaking change: plugins became global to the user rather than per-session, so a plugin installed only inside a named session on 0.7.3 must be installed again. |
+| **0.8.0** | **Verified** — full suite, no changes needed. No breaking changes in that release, and *"relative plugin commands now resolve from the plugin root"* matches how this manifest invokes `python3`. |
+
+`min_herdr_version` is set to 0.7.4 because that is the oldest release this was
+actually run against, not because 0.7.0–0.7.3 are known bad. Lowering it is safe
+if you need it, with the `done` caveat above.
+
+To check a new herdr release before upgrading, point the suite at its binary:
+
+```sh
+HERDR_BIN=/path/to/herdr-0.9.0 python3 tests/integration_test.py
+```
+
 ## Install
 
-Needs herdr ≥ 0.7.4 and Python 3 (3.11+ for TOML config; 3.8+ works with JSON config). No other dependencies.
+Needs herdr ≥ 0.7.4 (see above) and Python 3 — 3.11+ for TOML config, 3.8+ with
+JSON config (verified on 3.8, 3.9 and 3.11). No other dependencies.
 
 From GitHub, on the host whose herdr server you want to watch:
 
@@ -49,11 +71,11 @@ Either way, start the watcher for the current session:
 herdr plugin action invoke ghostty-tab-title.start
 ```
 
-After that it starts by itself. On herdr 0.8+ that is the plugin's `[[startup]]`
-hook; on 0.7.x, which ignores `[[startup]]`, the `pane.created` / `tab.created` /
-`workspace.created` event hooks do it — including during session restore, so it
-comes back with the server. Verified on 0.7.4: watcher up and title pushed
-within a second of the server restarting.
+After that it starts by itself. On herdr 0.7.5+ that is the plugin's
+`[[startup]]` hook; on 0.7.0–0.7.4, which parse `[[startup]]` but ignore it, the
+`pane.created` / `tab.created` / `workspace.created` event hooks do it —
+including during session restore, so it comes back with the server. Verified on
+0.7.4: watcher up and title pushed within a second of the server restarting.
 
 ### Remote hosts
 
@@ -109,7 +131,9 @@ herdr plugin action invoke ghostty-tab-title.refresh   # one-shot title update
 herdr plugin log list --plugin ghostty-tab-title       # stdout/stderr of the above
 ```
 
-Or directly, which is easier to read while debugging:
+Or directly, which is easier to read while debugging. These find herdr's managed
+config and state directories on their own, so they report the same thing the
+watcher herdr started is using:
 
 ```sh
 bin/herdr-ghostty-title status
@@ -201,7 +225,7 @@ The integration test boots a throwaway herdr session inside a pty, synthesises a
 ## Notes
 
 - Works with any terminal that honours OSC 0/2 titles. Ghostty is what it was built and tested against.
-- Tested against herdr 0.7.4 on macOS and Linux.
+- Verified against herdr 0.7.4 and 0.8.0; see the compatibility table.
 - herdr holds an attention state (`blocked`, `done`) on an unfocused pane until you look at it. That is herdr's behaviour, and the counts follow it.
 
 ## License

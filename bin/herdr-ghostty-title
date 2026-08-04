@@ -28,6 +28,9 @@ import subprocess
 import sys
 import time
 
+# Must match `id` in herdr-plugin.toml: used to find herdr-managed config.
+PLUGIN_ID = "ghostty-tab-title"
+
 STATUSES = ("blocked", "done", "working", "idle", "unknown")
 
 # Argument order for the `render` preview command.
@@ -87,17 +90,44 @@ def plugin_root() -> str:
 
 
 def state_dir() -> str:
-    path = os.environ.get("HERDR_PLUGIN_STATE_DIR") or os.path.join(
-        os.path.expanduser("~"), ".local", "state", "herdr-ghostty-tab-title"
-    )
+    path = os.environ.get("HERDR_PLUGIN_STATE_DIR")
+    if not path:
+        # As with config: herdr injects this only when it runs us. Prefer its
+        # managed directory when it exists, so `status`/`stop` invoked by hand
+        # find the watcher herdr started instead of looking in the wrong place.
+        xdg = os.environ.get("XDG_STATE_HOME") or os.path.join(
+            os.path.expanduser("~"), ".local", "state"
+        )
+        managed = os.path.join(xdg, "herdr", "plugins", PLUGIN_ID)
+        path = managed if os.path.isdir(managed) else os.path.join(xdg, PLUGIN_ID)
     os.makedirs(path, exist_ok=True)
     return path
 
 
+def herdr_config_root() -> str:
+    """herdr's config root, derived from the socket path.
+
+    <root>/herdr.sock for the default session, <root>/sessions/<name>/herdr.sock
+    for a named one. Plugin config is global to the user (herdr >= 0.7.5), so a
+    named session still resolves to the same root.
+    """
+    sock_dir = os.path.dirname(os.path.realpath(socket_path()))
+    if os.path.basename(os.path.dirname(sock_dir)) == "sessions":
+        return os.path.dirname(os.path.dirname(sock_dir))
+    return sock_dir
+
+
 def config_dir() -> str:
-    return os.environ.get("HERDR_PLUGIN_CONFIG_DIR") or os.path.join(
-        os.path.expanduser("~"), ".config", "herdr-ghostty-tab-title"
-    )
+    env = os.environ.get("HERDR_PLUGIN_CONFIG_DIR")
+    if env:
+        return env
+    # herdr only injects HERDR_PLUGIN_CONFIG_DIR when it runs us itself. Fall
+    # back to its documented layout so running this script by hand reads the
+    # same config the watcher does, instead of silently ignoring it.
+    managed = os.path.join(herdr_config_root(), "plugins", "config", PLUGIN_ID)
+    if os.path.isdir(managed):
+        return managed
+    return os.path.join(os.path.expanduser("~"), ".config", PLUGIN_ID)
 
 
 def socket_path() -> str:
@@ -420,7 +450,13 @@ def find_watcher():
             # socket can be spelled two ways.
             if os.path.realpath(recorded) != ours:
                 continue
-        if recorded is None and os.path.basename(path) != "watcher.lock":
+        if recorded is None and os.path.basename(path) not in (
+            # Pre-0.2.0 lock, one per state dir.
+            "watcher.lock",
+            # 0.2.0 lock written before the socket line existed. The filename
+            # already encodes our socket tag, so it is unambiguously ours.
+            os.path.basename(lock_file()),
+        ):
             continue
         if not _flock_is_held(path):
             continue

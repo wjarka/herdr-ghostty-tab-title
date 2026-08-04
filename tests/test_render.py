@@ -22,6 +22,12 @@ def load_module():
     return module
 
 
+# Never read the real user config: the script now falls back to herdr's managed
+# config dir, so an unguarded load_config() would pick up whatever the developer
+# has installed and make these tests depend on their machine.
+NO_CONFIG = "/nonexistent/hgt-tests.toml"
+os.environ.setdefault("HERDR_GHOSTTY_TITLE_CONFIG", NO_CONFIG)
+
 hgt = load_module()
 
 
@@ -185,7 +191,7 @@ class TestLabelTokens(unittest.TestCase):
             short = _socket.gethostname().split(".")[0]
             self.assertEqual(hgt.load_config()["label"], f"work@{short}")
         finally:
-            del os.environ["HERDR_GHOSTTY_TITLE_CONFIG"]
+            os.environ["HERDR_GHOSTTY_TITLE_CONFIG"] = NO_CONFIG
             del os.environ["HERDR_SOCKET_PATH"]
             os.unlink(path)
 
@@ -249,7 +255,16 @@ class TestWatcherDiscovery(unittest.TestCase):
         self.assertEqual(pid, 4245)
         self.assertEqual(found, path)
 
-    def test_legacy_naming_only_applies_to_watcher_lock(self):
+    def test_pid_only_lock_under_our_own_name_is_ours(self):
+        """A 0.2.0 lock written before the socket line existed is still ours.
+
+        Upgrading in place left exactly this on disk, and skipping it made a
+        live watcher invisible to status/stop/ensure.
+        """
+        self.hold(os.path.basename(hgt.lock_file()), "4250\n")
+        self.assertEqual(hgt.running_pid(), 4250)
+
+    def test_pid_only_lock_for_another_socket_tag_is_ignored(self):
         self.hold("watcher-deadbeef.lock", "4246\n")
         self.assertIsNone(hgt.running_pid())
 
@@ -301,7 +316,7 @@ class TestConfig(unittest.TestCase):
         try:
             self.assertEqual(hgt.load_config()["show"], ["blocked"])
         finally:
-            del os.environ["HERDR_GHOSTTY_TITLE_CONFIG"]
+            os.environ["HERDR_GHOSTTY_TITLE_CONFIG"] = NO_CONFIG
             os.unlink(path)
 
     def test_deep_merge_keeps_unspecified_glyphs(self):
@@ -322,7 +337,7 @@ class TestConfig(unittest.TestCase):
             self.assertEqual(c["label"], "fromjson")
             self.assertFalse(c["hide_zero"])
         finally:
-            del os.environ["HERDR_GHOSTTY_TITLE_CONFIG"]
+            os.environ["HERDR_GHOSTTY_TITLE_CONFIG"] = NO_CONFIG
             os.unlink(path)
 
     def test_toml_config_is_read(self):
@@ -342,7 +357,7 @@ class TestConfig(unittest.TestCase):
             self.assertEqual(c["glyphs"]["idle"], "z")
             self.assertEqual(c["glyphs"]["blocked"], hgt.DEFAULTS["glyphs"]["blocked"])
         finally:
-            del os.environ["HERDR_GHOSTTY_TITLE_CONFIG"]
+            os.environ["HERDR_GHOSTTY_TITLE_CONFIG"] = NO_CONFIG
             os.unlink(path)
 
 
