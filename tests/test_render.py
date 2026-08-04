@@ -190,6 +190,90 @@ class TestLabelTokens(unittest.TestCase):
             os.unlink(path)
 
 
+class TestWatcherDiscovery(unittest.TestCase):
+    """Regression: a lock under a different filename must still be found.
+
+    Renaming watcher.lock to watcher-<hash>.lock once orphaned a running
+    watcher, so two of them fought over the title. Identity now lives inside
+    the lock file, and discovery scans every watcher lock in the state dir.
+    """
+
+    def setUp(self):
+        import tempfile
+
+        self.dir = tempfile.mkdtemp(prefix="hgt-lock-")
+        self.sock = "/tmp/hgt-test/herdr.sock"
+        os.environ["HERDR_PLUGIN_STATE_DIR"] = self.dir
+        os.environ["HERDR_SOCKET_PATH"] = self.sock
+        self.held = []
+
+    def tearDown(self):
+        import shutil
+
+        for fd in self.held:
+            os.close(fd)
+        os.environ.pop("HERDR_PLUGIN_STATE_DIR", None)
+        os.environ.pop("HERDR_SOCKET_PATH", None)
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def hold(self, name, body):
+        """Create a lock file with `body` and hold an flock on it."""
+        import fcntl
+
+        path = os.path.join(self.dir, name)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(body)
+        fd = os.open(path, os.O_RDWR)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        self.held.append(fd)
+        return path
+
+    def test_nothing_running_by_default(self):
+        self.assertIsNone(hgt.running_pid())
+
+    def test_finds_lock_under_our_own_name(self):
+        self.hold(os.path.basename(hgt.lock_file()), f"4242\n{self.sock}\n")
+        self.assertEqual(hgt.running_pid(), 4242)
+
+    def test_finds_lock_under_a_foreign_filename(self):
+        self.hold("watcher-deadbeef.lock", f"4243\n{self.sock}\n")
+        self.assertEqual(hgt.running_pid(), 4243)
+
+    def test_ignores_lock_for_a_different_socket(self):
+        self.hold("watcher-deadbeef.lock", "4244\n/tmp/other/herdr.sock\n")
+        self.assertIsNone(hgt.running_pid())
+
+    def test_legacy_lock_without_socket_counts_as_ours(self):
+        path = self.hold("watcher.lock", "4245\n")
+        pid, found = hgt.find_watcher()
+        self.assertEqual(pid, 4245)
+        self.assertEqual(found, path)
+
+    def test_legacy_naming_only_applies_to_watcher_lock(self):
+        self.hold("watcher-deadbeef.lock", "4246\n")
+        self.assertIsNone(hgt.running_pid())
+
+    def test_unheld_lock_is_not_running(self):
+        with open(os.path.join(self.dir, "watcher.lock"), "w", encoding="utf-8") as fh:
+            fh.write(f"4247\n{self.sock}\n")
+        self.assertIsNone(hgt.running_pid())
+
+    def test_acquire_refuses_when_a_foreign_lock_is_held(self):
+        self.hold("watcher-deadbeef.lock", f"4248\n{self.sock}\n")
+        self.assertIsNone(hgt.acquire_lock())
+
+    def test_acquire_records_pid_and_socket(self):
+        fd = hgt.acquire_lock()
+        self.assertIsNotNone(fd)
+        try:
+            with open(hgt.lock_file(), encoding="utf-8") as fh:
+                lines = fh.read().splitlines()
+            self.assertEqual(int(lines[0]), os.getpid())
+            self.assertEqual(lines[1], os.path.realpath(self.sock))
+        finally:
+            os.close(fd)
+
+
 class TestConfig(unittest.TestCase):
     def test_defaults_are_sane(self):
         c = hgt.load_config()

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import errno
 import fcntl
+import glob
 import hashlib
 import json
 import os
@@ -363,6 +364,8 @@ def make_logger(cfg):
 
 def acquire_lock():
     """Return an open, flocked fd, or None if another watcher holds it."""
+    if find_watcher()[0]:
+        return None
     fd = os.open(lock_file(), os.O_RDWR | os.O_CREAT, 0o644)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -372,31 +375,65 @@ def acquire_lock():
             return None
         raise
     os.ftruncate(fd, 0)
-    os.write(fd, f"{os.getpid()}\n".encode())
+    # The socket goes in the file, not just in its name: a future change to the
+    # lock filename must not orphan a running watcher the way one already did.
+    os.write(fd, f"{os.getpid()}\n{os.path.realpath(socket_path())}\n".encode())
     os.fsync(fd)
     return fd
 
 
-def running_pid():
-    """PID of the live watcher, or None."""
-    path = lock_file()
-    if not os.path.exists(path):
-        return None
-    fd = os.open(path, os.O_RDWR)
+def _flock_is_held(path) -> bool:
+    """True if some live process holds an exclusive flock on path."""
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fd = os.open(path, os.O_RDWR)
     except OSError:
+        return False
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return True
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return False
+    finally:
+        os.close(fd)
+
+
+def find_watcher():
+    """(pid, lock_path) of the live watcher for our socket, else (None, None).
+
+    Scans every watcher lock in the state dir rather than only our own filename,
+    matching on the socket recorded inside. A lock with no socket line predates
+    that convention; the only such name ever shipped was `watcher.lock`, from
+    when one watcher per state dir was assumed, so treat it as ours.
+    """
+    ours = os.path.realpath(socket_path())
+    for path in sorted(glob.glob(os.path.join(state_dir(), "watcher*.lock"))):
         try:
             with open(path, encoding="utf-8") as fh:
-                return int((fh.read().strip() or "0")) or None
-        except (OSError, ValueError):
-            return -1  # locked but unreadable pid
-        finally:
-            os.close(fd)
-    else:
-        fcntl.flock(fd, fcntl.LOCK_UN)
-        os.close(fd)
-        return None
+                lines = fh.read().splitlines()
+        except OSError:
+            continue
+        recorded = lines[1].strip() if len(lines) > 1 and lines[1].strip() else None
+        if recorded is not None:
+            # Normalize both sides: /tmp is a symlink on macOS, so the same
+            # socket can be spelled two ways.
+            if os.path.realpath(recorded) != ours:
+                continue
+        if recorded is None and os.path.basename(path) != "watcher.lock":
+            continue
+        if not _flock_is_held(path):
+            continue
+        pid = None
+        if lines and lines[0].strip().isdigit():
+            pid = int(lines[0].strip())
+        return (pid or -1), path
+    return None, None
+
+
+def running_pid():
+    """PID of the live watcher for our socket, or None."""
+    return find_watcher()[0]
 
 
 # --------------------------------------------------------------------------- #
@@ -660,7 +697,7 @@ def cmd_ensure(_argv) -> int:
 
 
 def cmd_stop(_argv) -> int:
-    pid = running_pid()
+    pid, lock_path = find_watcher()
     if not pid:
         print("not running")
         return 0
@@ -678,6 +715,12 @@ def cmd_stop(_argv) -> int:
     for _ in range(40):
         time.sleep(0.05)
         if not running_pid():
+            # A legacy lock has served its purpose once its holder is gone.
+            if lock_path and os.path.basename(lock_path) == "watcher.lock":
+                try:
+                    os.unlink(lock_path)
+                except OSError:
+                    pass
             print(f"stopped (pid {pid})")
             return 0
     print(f"pid {pid} still running")

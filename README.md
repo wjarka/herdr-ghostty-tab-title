@@ -177,6 +177,18 @@ the tab title does not change, it is pinned.
 **Watcher won't start.** `watcher-<hash>.err` in the state dir holds the stderr
 of the detached process, including a traceback if it died on startup.
 
+**Tab title flips between two different titles.** Two watchers are pushing to the
+same client. Stop the plugin, confirm nothing survives, then start it again:
+
+```sh
+herdr plugin action invoke ghostty-tab-title.stop
+pgrep -af 'herdr-ghostty-title run'      # expect nothing for this server
+herdr plugin action invoke ghostty-tab-title.start
+```
+
+Always `stop` before upgrading or uninstalling: `herdr plugin uninstall` does not
+signal a running watcher. `scripts/install-remote.sh` does this for you.
+
 ## Tests
 
 ```sh

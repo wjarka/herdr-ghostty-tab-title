@@ -30,7 +30,11 @@ if [ ! -x "$herdr_bin" ]; then
 fi
 command -v python3 >/dev/null || { echo "python3 not found" >&2; exit 1; }
 
-# Reinstall cleanly so an existing copy is updated rather than conflicting.
+# Stop the running watcher BEFORE swapping the code out. `plugin uninstall`
+# does not signal it, and an orphaned watcher keeps pushing its own title -
+# two watchers then flip the tab title between them.
+"$herdr_bin" plugin action invoke "$PLUGIN_ID.stop" >/dev/null 2>&1 || true
+sleep 1
 "$herdr_bin" plugin uninstall "$PLUGIN_ID" >/dev/null 2>&1 || true
 "$herdr_bin" plugin install "$REPO" --yes >/dev/null
 "$herdr_bin" plugin action invoke "$PLUGIN_ID.start" >/dev/null
