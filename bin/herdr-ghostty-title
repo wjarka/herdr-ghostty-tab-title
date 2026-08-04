@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import errno
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -105,12 +106,22 @@ def socket_path() -> str:
     return os.path.join(os.path.expanduser("~"), ".config", "herdr", "herdr.sock")
 
 
+def _socket_tag() -> str:
+    """Short stable tag for the server we watch.
+
+    Two herdr sessions on one host can share a plugin state dir, so the lock and
+    log are scoped per socket: one watcher per server, not per host.
+    """
+    digest = hashlib.sha256(os.path.realpath(socket_path()).encode()).hexdigest()
+    return digest[:8]
+
+
 def lock_file() -> str:
-    return os.path.join(state_dir(), "watcher.lock")
+    return os.path.join(state_dir(), f"watcher-{_socket_tag()}.lock")
 
 
 def log_file() -> str:
-    return os.path.join(state_dir(), "watcher.log")
+    return os.path.join(state_dir(), f"watcher-{_socket_tag()}.log")
 
 
 # --------------------------------------------------------------------------- #
@@ -542,25 +553,35 @@ class Watcher:
 # --------------------------------------------------------------------------- #
 
 
+def crash_file() -> str:
+    return os.path.join(state_dir(), f"watcher-{_socket_tag()}.err")
+
+
 def spawn_detached() -> int:
-    """Start `run` in a fully detached child and return its pid."""
+    """Start `run` in a fully detached child and return its pid.
+
+    The child's stderr goes to a file rather than /dev/null: a watcher that dies
+    before its logger is up would otherwise vanish without a trace.
+    """
     script = os.path.abspath(__file__)
     env = dict(os.environ)
     env.pop("HERDR_GHOSTTY_TITLE_FOREGROUND", None)
-    devnull = os.open(os.devnull, os.O_RDWR)
+    devnull = os.open(os.devnull, os.O_RDONLY)
+    errfd = os.open(crash_file(), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
     try:
         proc = subprocess.Popen(
             [sys.executable, script, "run"],
             cwd=plugin_root(),
             env=env,
             stdin=devnull,
-            stdout=devnull,
-            stderr=devnull,
+            stdout=errfd,
+            stderr=errfd,
             start_new_session=True,
             close_fds=True,
         )
     finally:
         os.close(devnull)
+        os.close(errfd)
     return proc.pid
 
 
@@ -569,7 +590,9 @@ def cmd_run(_argv) -> int:
     log = make_logger(cfg)
     fd = acquire_lock()
     if fd is None:
-        log("info", "another watcher already holds the lock; exiting")
+        # Expected: session restore fires one `ensure` per restored pane, so a
+        # burst of losers is normal. Debug, not info.
+        log("debug", "another watcher already holds the lock; exiting")
         return 0
     try:
         Watcher(cfg, log).run()
@@ -595,7 +618,15 @@ def cmd_start(_argv) -> int:
         if pid:
             print(f"started (pid {pid})")
             return 0
+    detail = ""
+    try:
+        with open(crash_file(), encoding="utf-8", errors="replace") as fh:
+            detail = fh.read().strip()
+    except OSError:
+        pass
     print(f"spawned pid {child} but it did not take the lock; see {log_file()}")
+    if detail:
+        print(detail)
     return 1
 
 

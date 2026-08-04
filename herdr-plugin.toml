@@ -6,13 +6,18 @@ description = "Shows color-coded agent status counts (blocked / done / working /
 platforms = ["linux", "macos"]
 
 # Long-lived watcher. Starts detached and returns immediately, so it never
-# blocks herdr's startup sequence.
+# blocks herdr's startup sequence. Requires herdr >= 0.8.0; 0.7.x ignores
+# [[startup]], which is what the event hooks below cover.
 [[startup]]
 command = ["python3", "bin/herdr-ghostty-title", "start"]
 
-# Self-heal: if the watcher died, these cheap no-op-when-alive hooks bring it
-# back the next time you create a tab or a workspace. Both exit in milliseconds
-# when the watcher is already running.
+# Bootstrap on 0.7.x and self-heal everywhere. `ensure` exits in milliseconds
+# when a watcher already holds the lock, so these are cheap. Only low-frequency
+# events are used: panes/tabs/workspaces appearing, never focus or output.
+[[events]]
+on = "pane.created"
+command = ["python3", "bin/herdr-ghostty-title", "ensure"]
+
 [[events]]
 on = "tab.created"
 command = ["python3", "bin/herdr-ghostty-title", "ensure"]

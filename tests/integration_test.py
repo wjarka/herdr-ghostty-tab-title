@@ -73,8 +73,8 @@ class Session:
         self.titles = []
         self.buf = bytearray()
 
-    def start(self):
-        if os.path.exists(SESSION_DIR):
+    def start(self, wipe=True):
+        if wipe and os.path.exists(SESSION_DIR):
             shutil.rmtree(SESSION_DIR, ignore_errors=True)
         pid, fd = pty.fork()
         if pid == 0:
@@ -125,7 +125,7 @@ class Session:
                     return title
         raise Fail(f"timed out waiting for {what}; titles seen: {self.titles[-8:]}")
 
-    def stop(self):
+    def stop(self, remove_dir=True):
         if self.pid:
             try:
                 os.kill(self.pid, signal.SIGTERM)
@@ -138,7 +138,8 @@ class Session:
             except (OSError, Fail, json.JSONDecodeError):
                 pass
         time.sleep(0.5)
-        shutil.rmtree(SESSION_DIR, ignore_errors=True)
+        if remove_dir:
+            shutil.rmtree(SESSION_DIR, ignore_errors=True)
 
 
 _SEQ = [0]

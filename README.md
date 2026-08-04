@@ -43,13 +43,17 @@ git clone https://github.com/wjarka/herdr-ghostty-tab-title
 herdr plugin link "$PWD/herdr-ghostty-tab-title"
 ```
 
-Either way, start the watcher without waiting for a restart:
+Either way, start the watcher for the current session:
 
 ```sh
 herdr plugin action invoke ghostty-tab-title.start
 ```
 
-It starts by itself from then on, via the plugin's `[[startup]]` hook.
+After that it starts by itself. On herdr 0.8+ that is the plugin's `[[startup]]`
+hook; on 0.7.x, which ignores `[[startup]]`, the `pane.created` / `tab.created` /
+`workspace.created` event hooks do it — including during session restore, so it
+comes back with the server. Verified on 0.7.4: watcher up and title pushed
+within a second of the server restarting.
 
 ### Remote hosts
 
@@ -110,7 +114,12 @@ command = "ghostty-tab-title.refresh"
 4. herdr's client emits `OSC 0;<title>` to its terminal, and Ghostty makes that the tab title.
 5. Re-pushes unconditionally every 10s, so a client that detaches and re-attaches gets its title back.
 
-One watcher per herdr server, guarded by a `flock` in the plugin state dir. It reconnects with backoff when the server restarts, and two cheap `[[events]]` hooks restart it if it ever dies.
+One watcher per herdr server. The `flock` guarding it is keyed on the socket
+path, not just the state dir, because herdr hands every session on a host the
+same plugin state dir — without that, a second session would never get a title.
+The watcher reconnects with backoff when the server restarts, gives up after 10
+minutes with no server (the event hooks bring it back), and the `ensure` hooks
+restart it if it ever dies.
 
 ## Troubleshooting
 
@@ -121,6 +130,9 @@ One watcher per herdr server, guarded by a `flock` in the plugin state dir. It r
 **`config.toml ignored: python 3.x has no tomllib`.** Python is older than 3.11. Use `config.json` with the same keys.
 
 **Two herdr clients on one server.** Only the foreground one gets the title; herdr picks it, not this plugin.
+
+**Watcher won't start.** `watcher-<hash>.err` in the state dir holds the stderr
+of the detached process, including a traceback if it died on startup.
 
 ## Tests
 
